@@ -26,6 +26,8 @@ pip install -e crius-jpl
 
 ## Usage
 
+### Basic Usage
+
 ```python
 from crius_jpl import JplEphemerisAdapter
 from crius_ephemeris_core import EphemerisSettings, GeoLocation
@@ -52,6 +54,43 @@ dt = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 positions = adapter.calc_positions(dt, location, settings)
 
 print(positions["planets"]["sun"])
+```
+
+### Using the Service Entrypoint
+
+For convenience, you can use the service factory function:
+
+```python
+from crius_jpl import create_jpl_adapter, calc_positions
+from datetime import datetime, timezone
+
+# Create adapter using factory (respects SWISS_EPHEMERIS_PATH env var)
+adapter = create_jpl_adapter()
+
+# Or use the convenience function directly
+positions = calc_positions(
+    dt_utc=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+    location={"lat": 40.7128, "lon": -74.0060},
+    settings={
+        "zodiac_type": "tropical",
+        "ayanamsa": None,
+        "house_system": "placidus",
+        "include_objects": ["sun", "moon"],
+    }
+)
+```
+
+### Configuration via Environment Variables
+
+The adapter can be configured using environment variables:
+
+- `SWISS_EPHEMERIS_PATH`: Path to Swiss Ephemeris data files (default: `/usr/local/share/swisseph`)
+
+Example:
+
+```bash
+export SWISS_EPHEMERIS_PATH=/custom/path/to/swisseph
+python your_script.py
 ```
 
 ## Features
@@ -96,6 +135,21 @@ House calculations use Swiss Ephemeris and support:
 
 Note: House calculations use Swiss Ephemeris, which is dual-licensed under AGPL or a commercial license. For house calculations only, this typically doesn't affect the MIT license of this package, but users should be aware of Swiss Ephemeris licensing for house calculations.
 
+## Testing
+
+Run the test suite:
+
+```bash
+# Install development dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest tests/
+
+# Run with coverage
+pytest tests/ --cov=crius_jpl --cov-report=html
+```
+
 ## Dependencies
 
 - `crius-ephemeris-core` - Core types and interfaces
@@ -103,6 +157,14 @@ Note: House calculations use Swiss Ephemeris, which is dual-licensed under AGPL 
 - `pyswisseph` - Swiss Ephemeris for house calculations
 - `numpy` - Required by skyfield
 - `pytz` - Timezone support
+
+### Development Dependencies
+
+- `pytest` - Testing framework
+- `pytest-cov` - Coverage reporting
+- `mypy` - Type checking
+- `black` - Code formatting
+- `ruff` - Linting
 
 ## Related Packages
 

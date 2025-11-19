@@ -8,6 +8,7 @@ ephemeris data via the skyfield library.
 
 from datetime import datetime
 from typing import Optional
+import os
 import swisseph as swe
 import pytz
 from skyfield.api import load
@@ -22,6 +23,13 @@ from crius_ephemeris_core import (
     EphemerisAdapter,
 )
 
+from .exceptions import (
+    EphemerisDownloadError,
+    EphemerisLoadError,
+    DateRangeError,
+)
+from .validation import check_date_range
+
 # Skyfield planet body mapping
 SKYFIELD_BODIES = {
     "sun": "sun",
@@ -35,6 +43,43 @@ SKYFIELD_BODIES = {
     "neptune": "neptune barycenter",
     "pluto": "pluto barycenter",
 }
+
+# Shared skyfield loader instances (class-level cache)
+_shared_timescale = None
+_shared_ephemeris = None
+_loader_lock = None
+
+
+def _get_shared_loader():
+    """Get or create shared skyfield loader instances."""
+    global _shared_timescale, _shared_ephemeris, _loader_lock
+    
+    if _loader_lock is None:
+        import threading
+        _loader_lock = threading.Lock()
+    
+    with _loader_lock:
+        if _shared_timescale is None:
+            try:
+                _shared_timescale = load.timescale()
+            except Exception as e:
+                raise EphemerisLoadError(f"Failed to load skyfield timescale: {str(e)}") from e
+        
+        if _shared_ephemeris is None:
+            try:
+                _shared_ephemeris = load('de430t.bsp')
+            except Exception as e:
+                error_str = str(e).lower()
+                if 'download' in error_str or 'network' in error_str or 'connection' in error_str:
+                    raise EphemerisDownloadError(
+                        f"Failed to download JPL ephemeris data: {str(e)}"
+                    ) from e
+                else:
+                    raise EphemerisLoadError(
+                        f"Failed to load JPL ephemeris data: {str(e)}"
+                    ) from e
+    
+    return _shared_timescale, _shared_ephemeris
 
 # House system mapping (using Swiss Ephemeris for houses)
 HOUSE_SYSTEM_MAP = {
@@ -75,7 +120,7 @@ class JplEphemerisAdapter:
     Thin wrapper that conforms to the EphemerisAdapter protocol from crius-ephemeris-core.
     """
     
-    def __init__(self, ephemeris_path: Optional[str] = None):
+    def __init__(self, ephemeris_path: Optional[str] = None, retry_downloads: bool = True, use_shared_loader: bool = True):
         """
         Initialize adapter with JPL ephemeris data.
         
@@ -83,19 +128,54 @@ class JplEphemerisAdapter:
             ephemeris_path: Optional path for Swiss Ephemeris data files (for houses).
                           If None, uses default /usr/local/share/swisseph
                           or SWISS_EPHEMERIS_PATH environment variable.
+            retry_downloads: Whether to retry failed downloads (default: True)
+            use_shared_loader: Whether to use shared loader instances (default: True, more efficient)
+        
+        Raises:
+            EphemerisDownloadError: If ephemeris download fails
+            EphemerisLoadError: If ephemeris data fails to load
         """
-        # Load JPL ephemeris (skyfield automatically downloads DE430t on first use)
-        self.ts = load.timescale()
-        self.eph = load('de430t.bsp')
+        # Use shared loader instances for efficiency (shared across all adapter instances)
+        if use_shared_loader:
+            self.ts, self.eph = _get_shared_loader()
+        else:
+            # Load JPL ephemeris (skyfield automatically downloads DE430t on first use)
+            try:
+                self.ts = load.timescale()
+            except Exception as e:
+                raise EphemerisLoadError(f"Failed to load skyfield timescale: {str(e)}") from e
+            
+            # Try to load ephemeris with retry logic
+            max_retries = 3 if retry_downloads else 1
+            
+            for attempt in range(max_retries):
+                try:
+                    self.eph = load('de430t.bsp')
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        # Wait before retry (exponential backoff)
+                        import time
+                        time.sleep(2 ** attempt)
+                    else:
+                        # Check if it's a network/download error
+                        error_str = str(e).lower()
+                        if 'download' in error_str or 'network' in error_str or 'connection' in error_str:
+                            raise EphemerisDownloadError(
+                                f"Failed to download JPL ephemeris data after {max_retries} attempts: {str(e)}"
+                            ) from e
+                        else:
+                            raise EphemerisLoadError(
+                                f"Failed to load JPL ephemeris data: {str(e)}"
+                            ) from e
         
         # Initialize Swiss Ephemeris for house calculations
         if ephemeris_path is None:
-            import os
             ephemeris_path = os.getenv("SWISS_EPHEMERIS_PATH", "/usr/local/share/swisseph")
         swe.set_ephe_path(ephemeris_path)
         self.ephemeris_path = ephemeris_path
         
-        # Cache for skyfield bodies
+        # Cache for skyfield bodies (instance-level for thread safety)
         self._body_cache: dict[str, any] = {}
 
     def _get_body(self, planet_id: str):
@@ -130,7 +210,13 @@ class JplEphemerisAdapter:
             
         Returns:
             LayerPositions with planetary positions and optionally house positions
+        
+        Raises:
+            DateRangeError: If date is outside JPL DE430t supported range (1550-2650 CE)
         """
+        # Validate date range
+        check_date_range(dt_utc, raise_error=True)
+        
         # Convert datetime to Skyfield Time
         t = self.ts.utc(
             dt_utc.year,
@@ -170,8 +256,10 @@ class JplEphemerisAdapter:
                 continue
 
             if obj_id_lower == "chiron":
-                # Chiron not available in JPL, skip or use Swiss Ephemeris
-                # For now, skip it
+                # Chiron not available in JPL, use Swiss Ephemeris (hybrid approach)
+                chiron_pos = self._calc_chiron_swiss(dt_utc, settings)
+                if chiron_pos:
+                    planets["chiron"] = chiron_pos
                 continue
 
             planet_pos = self._calc_planet_position(obj_id_lower, t, dt_utc)
@@ -277,6 +365,56 @@ class JplEphemerisAdapter:
                     "retrograde": is_retrograde,
                 }
         except Exception:
+            pass
+        return None
+
+    def _calc_chiron_swiss(self, dt_utc: datetime, settings: EphemerisSettings) -> Optional[PlanetPosition]:
+        """
+        Calculate Chiron position using Swiss Ephemeris (hybrid approach).
+        
+        Chiron is not available in JPL ephemeris, so we use Swiss Ephemeris
+        for Chiron calculations while using JPL for other planets.
+        
+        Args:
+            dt_utc: UTC datetime for calculation
+            settings: Ephemeris settings (for zodiac type/flags)
+            
+        Returns:
+            PlanetPosition for Chiron or None if calculation fails
+        """
+        try:
+            jd = _datetime_to_jd(dt_utc)
+            
+            # Configure flags based on settings
+            flags = swe.FLG_SWIEPH
+            if settings.get("zodiac_type") == "sidereal":
+                flags |= swe.FLG_SIDEREAL
+                # Set ayanamsa if specified
+                ayanamsa = settings.get("ayanamsa")
+                if ayanamsa:
+                    # Map ayanamsa to Swiss Ephemeris constant
+                    from crius_swiss.adapter import AYANAMSA_MAP, DEFAULT_AYANAMSA
+                    mode = AYANAMSA_MAP.get(ayanamsa.lower(), DEFAULT_AYANAMSA)
+                    swe.set_sid_mode(mode, 0, 0)
+            
+            # Calculate Chiron using Swiss Ephemeris
+            result = swe.calc_ut(jd, swe.CHIRON, flags)
+            if result and len(result) > 0:
+                positions = result[0]
+                longitude = positions[0] % 360
+                latitude = positions[1] if len(positions) > 1 else 0.0
+                speed_longitude = positions[3] if len(positions) > 3 else 0.0
+                is_retrograde = speed_longitude < 0
+                
+                return {
+                    "lon": longitude,
+                    "lat": latitude,
+                    "speed_lon": speed_longitude,
+                    "retrograde": is_retrograde,
+                }
+        except Exception:
+            # If Swiss Ephemeris is not available or Chiron calculation fails,
+            # return None (Chiron will be skipped)
             pass
         return None
 
